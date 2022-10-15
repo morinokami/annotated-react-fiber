@@ -4,16 +4,18 @@
 // 3. workLoop 内でルートの Fiber を起点とする Fiber Tree を構築する
 // 4. Fiber Tree の構築が終わったら DOM に反映する
 
-type FiberType = {
+type Fiber = {
   type?: string
   props: {
     [key: string]: unknown
-    children: FiberType[]
+    children: Fiber[]
   }
   dom?: HTMLElement | Text | null
-  parent?: FiberType
-  child?: FiberType
-  sibling?: FiberType
+  parent?: Fiber
+  child?: Fiber
+  sibling?: Fiber
+  alternate?: Fiber | null // the fiber that we committed to the DOM in the previous commit phase
+  effectTag?: 'PLACEMENT' | 'DELETION' | 'UPDATE'
 }
 
 /**
@@ -24,8 +26,8 @@ type FiberType = {
 export function createElement(
   type: string,
   props?: Record<string, unknown> | null,
-  ...children: (string | FiberType)[]
-): FiberType {
+  ...children: (string | Fiber)[]
+): Fiber {
   return {
     type,
     props: {
@@ -38,7 +40,7 @@ export function createElement(
 }
 
 // string から Fiber を作成する
-function createTextElement(text: string): FiberType {
+function createTextElement(text: string): Fiber {
   return {
     type: 'TEXT_ELEMENT',
     props: {
@@ -53,25 +55,26 @@ function createTextElement(text: string): FiberType {
  */
 
 // Fiber から Fiber Tree のルートを構築し、レンダリング処理を開始する
-export function render(
-  element: FiberType,
-  container: HTMLElement | Text,
-): void {
+export function render(element: Fiber, container: HTMLElement | Text): void {
   // Fiber Tree のルートを作成し、次の処理対象として設定する
   wipRoot = {
     dom: container,
     props: {
       children: [element],
     },
+    alternate: currentRoot,
   }
+  deletions = []
   nextUnitOfWork = wipRoot
 
   // レンダリング処理を開始する
   requestIdleCallback(workLoop)
 }
 
-let nextUnitOfWork: FiberType | null = null
-let wipRoot: FiberType | null = null
+let nextUnitOfWork: Fiber | null = null
+let currentRoot: Fiber | null = null
+let wipRoot: Fiber | null = null
+let deletions: Fiber[] | null = null
 
 // Fiber Tree を構築し、すべての処理が終わったら DOM に反映する
 function workLoop(deadline: IdleDeadline): void {
@@ -96,7 +99,7 @@ function workLoop(deadline: IdleDeadline): void {
  */
 
 // Fiber Tree を構築する
-function performUnitOfWork(fiber: FiberType): FiberType | null {
+function performUnitOfWork(fiber: Fiber): Fiber | null {
   // Fiber 自身を DOM に反映する
   if (!fiber.dom) {
     fiber.dom = createDom(fiber)
@@ -104,26 +107,7 @@ function performUnitOfWork(fiber: FiberType): FiberType | null {
 
   // Fiber の子要素を構成する
   const elements = fiber.props.children
-  let index = 0
-  let prevSibling: FiberType | null = null
-  while (index < elements.length) {
-    const element = elements[index]
-    const newFiber: FiberType = {
-      type: element.type,
-      props: element.props,
-      parent: fiber,
-      dom: null,
-    }
-
-    if (index === 0) {
-      fiber.child = newFiber
-    } else if (prevSibling) {
-      prevSibling.sibling = newFiber
-    }
-
-    prevSibling = newFiber
-    index++
-  }
+  reconcileChildren(fiber, elements)
 
   // 次の処理対象となる Fiber を返す
   if (fiber.child) {
@@ -140,8 +124,65 @@ function performUnitOfWork(fiber: FiberType): FiberType | null {
   return null
 }
 
+function reconcileChildren(wipFiber: Fiber, elements: Fiber[]): void {
+  let index = 0
+  let oldFiber = wipFiber.alternate && wipFiber.alternate.child
+  let prevSibling: Fiber | null = null
+
+  while (index < elements.length || oldFiber != null) {
+    // oldFiber: what we rendered last time
+    // element: what we are rendering now
+    const element = elements[index]
+    let newFiber: Fiber | null = null
+
+    const sameType = oldFiber && element && element.type === oldFiber.type
+    if (sameType) {
+      // 以前の Fiber と新しい Fiber が同じタイプである場合、props を更新する
+      newFiber = {
+        type: oldFiber!.type,
+        props: element.props,
+        dom: oldFiber!.dom,
+        parent: wipFiber,
+        alternate: oldFiber,
+        effectTag: 'UPDATE',
+      }
+    }
+    if (element && !sameType) {
+      // タイプが異なり、かつ新しい Fiber が存在する場合、新しい DOM ノードを作成する
+      if (element && !sameType) {
+        newFiber = {
+          type: element.type,
+          props: element.props,
+          dom: null,
+          parent: wipFiber,
+          alternate: null,
+          effectTag: 'PLACEMENT',
+        }
+      }
+    }
+    if (oldFiber && !sameType) {
+      // タイプが異なり、かつ以前の Fiber が存在する場合、以前の DOM ノードを削除する
+      oldFiber.effectTag = 'DELETION'
+      deletions?.push(oldFiber)
+    }
+
+    if (oldFiber) {
+      oldFiber = oldFiber.sibling
+    }
+
+    if (index === 0) {
+      wipFiber.child = newFiber
+    } else if (element) {
+      prevSibling.sibling = newFiber
+    }
+
+    prevSibling = newFiber
+    index++
+  }
+}
+
 // 実際にレンダリング可能な Node へと Fiber を変換する
-function createDom(filber: FiberType): HTMLElement | Text {
+function createDom(filber: Fiber): HTMLElement | Text {
   // Node を作成する
   const dom =
     filber.type === 'TEXT_ELEMENT'
@@ -159,26 +200,82 @@ function createDom(filber: FiberType): HTMLElement | Text {
   return dom
 }
 
+const isEvent = (key: string) => key.startsWith('on')
+const isProperty = (key: string) => key !== 'children' && !isEvent(key)
+const isNew =
+  (prev: Record<string, unknown>, next: Record<string, unknown>) =>
+  (key: string) =>
+    prev[key] !== next[key]
+const isGone =
+  (prev: Record<string, unknown>, next: Record<string, unknown>) =>
+  (key: string) =>
+    !(key in next)
+function updateDom(
+  dom: HTMLElement | Text,
+  prevProps: Record<string, unknown>,
+  nextProps: Record<string, unknown>,
+): void {
+  // イベントリスナーのうち、既にあるものや変更があったものを削除する
+  Object.keys(prevProps)
+    .filter(isEvent)
+    .filter((key) => !(key in nextProps) || isNew(prevProps, nextProps)(key))
+    .forEach((name) => {
+      const eventType = name.toLowerCase().substring(2)
+      dom.removeEventListener(eventType, prevProps[name])
+    })
+
+  // 以前のプロパティを削除する
+  Object.keys(prevProps)
+    .filter(isProperty)
+    .filter(isGone(prevProps, nextProps))
+    .forEach((name) => {
+      dom[name] = ''
+    })
+
+  // 新規、または変更されたプロパティをセットする
+  Object.keys(nextProps)
+    .filter(isProperty)
+    .filter(isNew(prevProps, nextProps))
+    .forEach((name) => {
+      dom[name] = nextProps[name]
+    })
+
+  // イベントリスナーをセットする
+  Object.keys(nextProps)
+    .filter(isEvent)
+    .filter(isNew(prevProps, nextProps))
+    .forEach((name) => {
+      const eventType = name.toLowerCase().substring(2)
+      dom.addEventListener(eventType, nextProps[name])
+    })
+}
+
 /**
  * Fiber Tree の DOM への反映
  */
 
 // Fiber Tree を DOM に反映し、それが終わったら Fiber Tree を初期化する
 function commitRoot(): void {
+  deletions?.forEach(commitWork)
   commitWork(wipRoot?.child)
+  currentRoot = wipRoot
   wipRoot = null
 }
 
 // Fiber Tree を DOM に反映する
-function commitWork(fiber?: FiberType | null): void {
+function commitWork(fiber?: Fiber | null): void {
   if (!fiber) {
     return
   }
 
   // 自身を DOM に反映する
   const domParent = fiber.parent?.dom
-  if (domParent && fiber.dom) {
-    domParent.appendChild(fiber.dom)
+  if (fiber.effectTag === 'PLACEMENT' && fiber.dom) {
+    domParent?.appendChild(fiber.dom)
+  } else if (fiber.effectTag === 'UPDATE' && fiber.dom) {
+    updateDom(fiber.dom, fiber.alternate?.props, fiber.props)
+  } else if (fiber.effectTag === 'DELETION' && fiber.dom) {
+    domParent?.removeChild(fiber.dom)
   }
 
   // 子要素を DOM に反映する
