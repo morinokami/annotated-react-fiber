@@ -1,8 +1,7 @@
 // 処理の流れ
-// 1. createElement により Fiber を作成する
-// 2. render により レンダリング処理を開始する
-// 3. workLoop 内でルートの Fiber を起点とする Fiber Tree を構築する
-// 4. Fiber Tree の構築が終わったら DOM に反映する
+// 1. レンダリング開始
+// 2. Reconciliation
+// 3. Fiber Tree の DOM への反映
 
 type Fiber = {
   type?: string
@@ -10,12 +9,12 @@ type Fiber = {
     [key: string]: unknown
     children: Fiber[]
   }
-  dom?: HTMLElement | Text | null
+  dom?: HTMLElement | Text | null // Fiber に対応する DOM
   parent?: Fiber
   child?: Fiber
   sibling?: Fiber
-  alternate?: Fiber | null // the fiber that we committed to the DOM in the previous commit phase
-  effectTag?: 'PLACEMENT' | 'DELETION' | 'UPDATE'
+  alternate?: Fiber | null // 直前に DOM にコミットされた Fiber
+  effectTag?: 'PLACEMENT' | 'DELETION' | 'UPDATE' // DOM に反映する際の処理の種類
 }
 
 /**
@@ -54,6 +53,11 @@ function createTextElement(text: string): Fiber {
  * Fiber のレンダリング
  */
 
+let nextUnitOfWork: Fiber | null = null // 次に処理する Fiber
+let currentRoot: Fiber | null = null // 直前に DOM にコミットされた Fiber
+let wipRoot: Fiber | null = null // Fiber Tree のルート
+let deletions: Fiber[] | null = null // 削除対象の Fiber
+
 // Fiber から Fiber Tree のルートを構築し、レンダリング処理を開始する
 export function render(element: Fiber, container: HTMLElement | Text): void {
   // Fiber Tree のルートを作成し、次の処理対象として設定する
@@ -70,11 +74,6 @@ export function render(element: Fiber, container: HTMLElement | Text): void {
   // レンダリング処理を開始する
   requestIdleCallback(workLoop)
 }
-
-let nextUnitOfWork: Fiber | null = null
-let currentRoot: Fiber | null = null
-let wipRoot: Fiber | null = null
-let deletions: Fiber[] | null = null
 
 // Fiber Tree を構築し、すべての処理が終わったら DOM に反映する
 function workLoop(deadline: IdleDeadline): void {
@@ -98,18 +97,46 @@ function workLoop(deadline: IdleDeadline): void {
  * Fiber Tree の構築
  */
 
-// Fiber Tree を構築する
+// 自身の DOM を構築し、次の処理対象の Fiber を返す
 function performUnitOfWork(fiber: Fiber): Fiber | null {
-  // Fiber 自身を DOM に反映する
+  // Fiber 自身の DOM を作成する
   if (!fiber.dom) {
     fiber.dom = createDom(fiber)
   }
 
-  // Fiber の子要素を構成する
+  // Fiber の子要素を取得し、それを Fiber Tree として構築する
   const elements = fiber.props.children
   reconcileChildren(fiber, elements)
 
-  // 次の処理対象となる Fiber を返す
+  /**
+   * 次の処理対象となる Fiber を返す
+   *
+   * ┌──────┐
+   * │ root │
+   * └─┬────┘
+   *   │  ▲
+   *   │  │
+   *   ▼  │
+   * ┌────┴──┐
+   * │ <div> │
+   * └─┬─────┘
+   *   │  ▲ ▲
+   *   │  │ └───────┐
+   *   ▼  │         │
+   * ┌────┴─┐      ┌┴─────┐
+   * │ <h1> ├─────►│ <h2> │
+   * └─┬────┘      └──────┘
+   *   │  ▲ ▲
+   *   │  │ └───────┐
+   *   ▼  │         │
+   * ┌────┴┐       ┌┴────┐
+   * │ <p> ├──────►│ <a> │
+   * └─────┘       └─────┘
+   *
+   * 上の図で考えると、
+   * root -> <div> -> <h1> -> <p> -> <a> -> <h2>
+   * という順番で処理される
+   */
   if (fiber.child) {
     return fiber.child
   }
@@ -124,45 +151,44 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
   return null
 }
 
+// 子要素に関して、既存の Fiber に新しい Fiber との差分を反映する
 function reconcileChildren(wipFiber: Fiber, elements: Fiber[]): void {
   let index = 0
-  let oldFiber = wipFiber.alternate && wipFiber.alternate.child
+  let oldFiber = wipFiber.alternate && wipFiber.alternate.child // 直前に DOM にコミットされた Fiber
   let prevSibling: Fiber | null = null
 
   while (index < elements.length || oldFiber != null) {
     // oldFiber: what we rendered last time
     // element: what we are rendering now
-    const element = elements[index]
+    const element = elements[index] // 次に DOM に反映する Fiber
     let newFiber: Fiber | null = null
 
     const sameType = oldFiber && element && element.type === oldFiber.type
     if (sameType) {
-      // 以前の Fiber と新しい Fiber が同じタイプである場合、props を更新する
+      // 以前の Fiber と新しい Fiber が同じタイプである場合、props のみを更新する
       newFiber = {
         type: oldFiber!.type,
         props: element.props,
         dom: oldFiber!.dom,
         parent: wipFiber,
         alternate: oldFiber,
-        effectTag: 'UPDATE',
+        effectTag: 'UPDATE', // 更新
       }
     }
     if (element && !sameType) {
       // タイプが異なり、かつ新しい Fiber が存在する場合、新しい DOM ノードを作成する
-      if (element && !sameType) {
-        newFiber = {
-          type: element.type,
-          props: element.props,
-          dom: null,
-          parent: wipFiber,
-          alternate: null,
-          effectTag: 'PLACEMENT',
-        }
+      newFiber = {
+        type: element.type,
+        props: element.props,
+        dom: null,
+        parent: wipFiber,
+        alternate: null,
+        effectTag: 'PLACEMENT', // 追加
       }
     }
     if (oldFiber && !sameType) {
       // タイプが異なり、かつ以前の Fiber が存在する場合、以前の DOM ノードを削除する
-      oldFiber.effectTag = 'DELETION'
+      oldFiber.effectTag = 'DELETION' // 削除
       deletions?.push(oldFiber)
     }
 
@@ -189,13 +215,8 @@ function createDom(filber: Fiber): HTMLElement | Text {
       ? document.createTextNode('')
       : document.createElement(filber.type ?? '')
 
-  // children 以外の Fiber の props を Node に反映する
-  const isProperty = (key: string) => key !== 'children'
-  Object.keys(filber.props)
-    .filter(isProperty)
-    .forEach((name: string) => {
-      dom[name] = filber.props[name]
-    })
+  // Fiber の props を DOM に反映する
+  updateDom(dom, {}, filber.props)
 
   return dom
 }
